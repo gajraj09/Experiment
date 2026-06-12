@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TradingBot</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <nav class="navbar" aria-label="Intervals">
+        <div class="brand">TradingBot</div>
+        <div class="tabs" role="tablist">
+          <button class="tab active" type="button" data-interval="5m" role="tab">5min</button>
+          <button class="tab" type="button" data-interval="15m" role="tab">15min</button>
+        </div>
+      </nav>
+
+      <section class="market">
+        <div class="header-row">
+          <div>
+            <p class="label">XRPUSDC perpetual</p>
+            <h1 id="interval-title">5min</h1>
+          </div>
+          <div class="header-cards">
+            <div class="position-block" id="position-card">
+              <span class="label">Current Position</span>
+              <strong id="position-side">Flat</strong>
+              <div class="position-meta" id="position-meta">No open position</div>
+            </div>
+            <div class="position-block" id="position-card1">
+              <span class="label">Status</span>
+              <strong id="fill-status">None</strong>
+              <!-- <div class="position-meta" id="position-meta">No open position</div> -->
+            </div>
+            <div class="price-block">
+              <span class="label">Live ticker</span>
+              <div class="live-status-row">
+                <strong id="ticker-price">--</strong>
+                <div class="ticker-badge">
+                  <span id="live-status" class="live-dot offline" aria-label="Ticker offline"></span>
+                  <span id="live-status-text" class="live-status-label">Offline</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <section class="panel">
+          <div class="panel-title">Open Candle</div>
+          <div class="ohlc-grid" id="open-candle"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">Current Trade Levels</div>
+          <div class="levels-grid" id="trade-levels"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">Trade Execution Status</div>
+          <div class="levels-grid" id="trade-execution-status"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">Last 2 Closed Candles</div>
+          <div class="candles" id="closed-candles"></div>
+        </section>
+
+        <section class="panel trade-history-panel">
+          <div class="trade-history-header">
+            <div class="panel-title">Trade History</div>
+            <span class="trade-count" id="trade-count">0 trades</span>
+          </div>
+          <div class="trade-table-wrap">
+            <table class="trade-table">
+              <thead>
+                <tr>
+                  <th>Trade #</th>
+                  <th>Type</th>
+                  <th>Date &amp; Time</th>
+                  <th>Signal</th>
+                  <th>Entry Price</th>
+                  <th>Quantity</th>
+                  <th>Fill</th>
+                  <th>Net P&amp;L</th>
+                  <th>Favorable Excursion</th>
+                  <th>Adverse Excursion</th>
+                  <th>Cumulative P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody id="trade-history"></tbody>
+            </table>
+            <div class="trade-empty" id="trade-empty">No trades yet. Trade logic will be connected soon.</div>
+          </div>
+          <div class="trade-summary" id="trade-summary"></div>
+        </section>
+
+        <p class="status" id="status">Loading market data...</p>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

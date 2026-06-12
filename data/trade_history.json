@@ -1,0 +1,29 @@
+{
+  "5m": [
+    {
+      "tradeNumber": 1,
+      "type": "long",
+      "signal": "Entry",
+      "dateTime": "2026-06-12T08:30:00Z",
+      "price": 1.1452,
+      "size": 100.0,
+      "netPnl": null,
+      "favorableExcursion": null,
+      "adverseExcursion": null,
+      "cumulativePnl": null
+    },
+    {
+      "tradeNumber": 2,
+      "type": "long",
+      "signal": "Entry",
+      "dateTime": "2026-06-12T08:30:00Z",
+      "price": 1.1452,
+      "size": 100.0,
+      "netPnl": null,
+      "favorableExcursion": null,
+      "adverseExcursion": null,
+      "cumulativePnl": null
+    }
+  ],
+  "15m": []
+}

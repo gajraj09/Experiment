@@ -1,0 +1,32 @@
+Strategy Name: Volty Expan Close Strategy
+
+Trade Levels:
+- Buy Trigger Price
+- Sell Trigger Price
+- ATR Value
+- Current Candle Open Time
+
+Rules:
+
+1. One trade is allowed per candle.
+
+2. Current candle is identified by current_open_time.
+
+3. If Current Position = LONG and ticker price <= Sell Trigger Price:
+   - Execute SHORT trade
+   - Mark tradePlacedInCurrentCandle = true
+
+4. If Current Position = SHORT and ticker price >= Buy Trigger Price:
+   - Execute LONG trade
+   - Mark tradePlacedInCurrentCandle = true
+
+5. When a new candle opens:
+   - Reset tradePlacedInCurrentCandle = false
+
+6. Trade logic is evaluated on every incoming live quote update while the current candle is open.
+   - The logic should run on both book ticker and trade stream updates if tradePlacedInCurrentCandle is false.
+
+7. Trade numbers are sequential per interval and assigned from the database on fill.
+   - `executedTradeNumber` reflects the most recently filled trade.
+
+8. Logic must work independently for 5m and 15m intervals.
