@@ -195,6 +195,7 @@ function renderTradeHistory(rows) {
           <td>
             ${row.fill_status ? `<span class="fill-badge ${row.fill_status.toLowerCase()}">${row.fill_status}</span>` : '<span class="neutral">--</span>'}
           </td>
+          <td>${row.fill_time ? formatTime(row.fill_time) : '<span class="neutral">--</span>'}</td>
           <td>${formatPnl(row.netPnl)}</td>
           <td>${formatExcursion(row.favorableExcursion, true)}</td>
           <td>${formatExcursion(row.adverseExcursion, false)}</td>
@@ -205,6 +206,91 @@ function renderTradeHistory(rows) {
     .join("");
 
   renderTradeSummary(rows);
+}
+
+function exportRowsToCSV(rows) {
+  if (!rows || !rows.length) return null;
+  const headers = [
+    'tradeNumber','type','dateTime','signal','price','size','fill_status','fill_time','netPnl','favorableExcursion','adverseExcursion','cumulativePnl'
+  ];
+
+  const csv = [headers.join(',')];
+  for (const r of rows) {
+    const values = headers.map((h) => {
+      let v = r[h];
+      if (v === null || v === undefined) return '';
+      // if date, format as ISO
+      if (h === 'dateTime' || h === 'fill_time') {
+        try { return `"${new Date(v).toISOString()}"`; } catch(e) { return `"${v}"`; }
+      }
+      // escape quotes and commas
+      if (typeof v === 'string') return `"${v.replace(/"/g, '""')}"`;
+      return String(v);
+    });
+    csv.push(values.join(','));
+  }
+
+  return csv.join('\n');
+}
+
+function triggerDownload(filename, content, mime = 'text/csv') {
+  const blob = new Blob([content], { type: mime + ';charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// Attach download handler immediately (script is loaded at end of body)
+const _downloadBtn = document.querySelector('#download-trades');
+if (_downloadBtn) {
+  _downloadBtn.addEventListener('click', async () => {
+    try {
+      console.log('Download button clicked for interval', activeInterval);
+      let market = marketCache.get(activeInterval);
+      if (!market) {
+        console.log('No cached market, fetching...');
+        market = await fetchMarket(activeInterval).catch((e) => {
+          console.error('fetchMarket failed', e);
+          return null;
+        });
+      }
+
+      let rows = market?.trade_history || [];
+      if (!rows || rows.length === 0) {
+        // fallback: call trades endpoint which returns { trade_history: [...] }
+        console.log('No rows in market response, fetching /api/trades');
+        try {
+          const resp = await fetch(`/api/trades/${activeInterval}`, { cache: 'no-store' });
+          if (resp.ok) {
+            const json = await resp.json();
+            rows = json.trade_history || [];
+          } else {
+            console.warn('Failed to fetch /api/trades', await resp.text());
+          }
+        } catch (e) {
+          console.error('Error fetching /api/trades', e);
+        }
+      }
+
+      const csv = exportRowsToCSV(rows);
+      if (!csv) {
+        alert('No trade data to download');
+        return;
+      }
+      const now = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `trades-${activeInterval}-${now}.csv`;
+      console.log('Triggering download', filename, 'rows:', rows.length);
+      triggerDownload(filename, csv, 'text/csv');
+    } catch (err) {
+      console.error('Download handler error', err);
+      alert('Unable to download trade data. See console for details.');
+    }
+  });
 }
 
 function renderCurrentPosition(position) {
@@ -297,6 +383,9 @@ function setIntervalTab(interval) {
   if (cachedMarket) {
     renderMarket(cachedMarket);
     statusLine.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    // update download link
+    const dl = document.querySelector('#download-trades');
+    if (dl) dl.href = `/api/trades/${interval}/download`;
   } else {
     statusLine.textContent = "Loading market data...";
     loadMarket(interval, true);

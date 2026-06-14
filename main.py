@@ -14,7 +14,7 @@ import orjson
 import websockets
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 
@@ -141,10 +141,16 @@ def init_database() -> None:
             connection.execute("ALTER TABLE trade_history ADD COLUMN fill_status TEXT")
         if "fill_time" not in cols:
             connection.execute("ALTER TABLE trade_history ADD COLUMN fill_time TEXT")
+        # track the ticker at time of placement and whether price has moved since placement
+        if "placed_ticker" not in cols:
+            connection.execute("ALTER TABLE trade_history ADD COLUMN placed_ticker REAL")
+        if "moved_since_placement" not in cols:
+            connection.execute("ALTER TABLE trade_history ADD COLUMN moved_since_placement INTEGER DEFAULT 0")
 
 
 def trade_row_from_db(row: sqlite3.Row) -> dict[str, Any]:
     return {
+        "id": row["id"],
         "tradeNumber": row["tradeNumber"],
         "type": row["type"],
         "dateTime": row["dateTime"],
@@ -157,6 +163,8 @@ def trade_row_from_db(row: sqlite3.Row) -> dict[str, Any]:
         "cumulativePnl": row["cumulativePnl"],
         "fill_status": row["fill_status"] if "fill_status" in row.keys() else None,
         "fill_time": row["fill_time"] if "fill_time" in row.keys() else None,
+        "placed_ticker": row["placed_ticker"] if "placed_ticker" in row.keys() else None,
+        "moved_since_placement": bool(row["moved_since_placement"]) if "moved_since_placement" in row.keys() else False,
     }
 
 
@@ -164,9 +172,9 @@ def get_trade_history(interval: str) -> list[dict[str, Any]]:
     with database_connection() as connection:
         rows = connection.execute(
             """
-            SELECT tradeNumber, type, dateTime, signal, price, size, netPnl,
+            SELECT id, tradeNumber, type, dateTime, signal, price, size, netPnl,
                    favorableExcursion, adverseExcursion, cumulativePnl,
-                   fill_status, fill_time
+                   fill_status, fill_time, placed_ticker, moved_since_placement
             FROM trade_history
             WHERE interval = ?
             ORDER BY id ASC
@@ -205,8 +213,9 @@ def get_execution_trade_by_candle(interval: str, executed_candle_open_time: int)
     with database_connection() as connection:
         row = connection.execute(
             """
-            SELECT tradeNumber, type, dateTime, signal, price, size, netPnl,
-                   favorableExcursion, adverseExcursion, cumulativePnl
+            SELECT id, tradeNumber, type, dateTime, signal, price, size, netPnl,
+                   favorableExcursion, adverseExcursion, cumulativePnl, fill_status, fill_time,
+                   placed_ticker, moved_since_placement
             FROM trade_history
             WHERE interval = ? AND executedCandleOpenTime = ?
             ORDER BY id DESC LIMIT 1
@@ -224,8 +233,7 @@ def restore_trade_state_from_db(interval: str, current_open_time: int | None = N
     current_position_by_interval[interval] = {
         "type": row["type"],
         "entryPrice": float(Decimal(str(row["price"])).quantize(price_tick_size)),
-        "size": row["size"],
-    }
+        "size": row["size"],        "tradeId": row["id"],    }
 
     execution_state = trade_execution_state_by_interval[interval]
     execution_state["executedTradeNumber"] = row["tradeNumber"]
@@ -253,14 +261,21 @@ def next_trade_number(interval: str, connection: sqlite3.Connection | None = Non
 
 
 def check_and_update_last_unfilled_trade(interval: str, ticker_price: Decimal, event_time: int | None) -> bool:
-    """Check the latest unfilled trade for the given interval and mark it Filled
-    when the refined condition is met. Returns True if an update was performed."""
+    """Check the current open trade for this interval and mark it Filled
+    only when the refined condition is met. Returns True if an update was performed."""
+    current_position = current_position_by_interval.get(interval)
+    if not current_position:
+        return False
+
+    trade_id = current_position.get("tradeId")
+    if not trade_id:
+        return False
+
     try:
         with database_connection() as connection:
-            # look up last unfilled trade for this interval
             row = connection.execute(
-                "SELECT * FROM trade_history WHERE interval = ? AND fill_status = ? ORDER BY id DESC LIMIT 1",
-                (interval, "Unfilled"),
+                "SELECT * FROM trade_history WHERE id = ? AND interval = ? AND fill_status = ?",
+                (trade_id, interval, "Unfilled"),
             ).fetchone()
 
             if not row:
@@ -268,12 +283,41 @@ def check_and_update_last_unfilled_trade(interval: str, ticker_price: Decimal, e
 
             pos = row["type"]
             entry_price = Decimal(str(row["price"])).quantize(price_tick_size)
+            placed_ticker = None
+            moved_flag = bool(row["moved_since_placement"]) if "moved_since_placement" in row.keys() else False
+            if "placed_ticker" in row.keys():
+                try:
+                    placed_ticker = Decimal(str(row["placed_ticker"])).quantize(price_tick_size)
+                except Exception:
+                    placed_ticker = None
+
+            # If price is still at placement and hasn't moved, do not fill yet
+            if placed_ticker is not None and ticker_price == placed_ticker and not moved_flag:
+                return False
 
             should_fill = False
             if pos == "long" and ticker_price <= entry_price:
-                should_fill = True
+                # require that price has moved since placement before filling; allow older rows
+                if moved_flag or placed_ticker is None:
+                    should_fill = True
             elif pos == "short" and ticker_price >= entry_price:
-                should_fill = True
+                if moved_flag or placed_ticker is None:
+                    should_fill = True
+
+            # If we haven't yet seen price move since placement, but the current tick differs
+            # from the placed ticker, mark moved_since_placement and continue checking for fill.
+            if not moved_flag and placed_ticker is not None and ticker_price != placed_ticker:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "UPDATE trade_history SET moved_since_placement = 1 WHERE id = ?",
+                        (int(row["id"]),),
+                    )
+                    connection.commit()
+                    moved_flag = True
+                except Exception:
+                    logger.exception("Failed to mark moved_since_placement for id=%s", row["id"])
+                    return False
 
             if not should_fill:
                 return False
@@ -396,6 +440,8 @@ def create_execution_trade_row(
         "cumulativePnl": None,
         "fill_status": "Unfilled",
         "fill_time": None,
+        "placed_ticker": None,
+        "moved_since_placement": False,
     }
 
 
@@ -405,18 +451,22 @@ def insert_execution_trade(
     execution_price: Decimal,
     event_time: int | None,
     executed_candle_open_time: int,
+    placement_ticker: Decimal | None = None,
 ) -> dict[str, Any] | None:
     with database_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = create_execution_trade_row(interval, trade_type, execution_price, event_time, connection)
+        # store the ticker observed at the time of placement so we can require price movement before fill
+        row["placed_ticker"] = float(placement_ticker) if placement_ticker is not None else None
+        row["moved_since_placement"] = False
         cursor = connection.execute(
             """
             INSERT OR IGNORE INTO trade_history (
                 interval, tradeNumber, type, dateTime, signal, price, size,
                 netPnl, favorableExcursion, adverseExcursion, cumulativePnl,
-                executedCandleOpenTime, fill_status, fill_time
+                executedCandleOpenTime, fill_status, fill_time, placed_ticker, moved_since_placement
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 interval,
@@ -433,6 +483,8 @@ def insert_execution_trade(
                 executed_candle_open_time,
                 row.get("fill_status"),
                 row.get("fill_time"),
+                row["placed_ticker"],
+                row["moved_since_placement"],
             ),
         )
         connection.commit()
@@ -452,7 +504,7 @@ def insert_execution_trade(
             row["price"],
             executed_candle_open_time,
         )
-        return row
+        return get_execution_trade_by_candle(interval, executed_candle_open_time)
 
 
 def trade_row_to_dict(trade: TradeRow) -> dict[str, Any]:
@@ -592,6 +644,7 @@ async def evaluate_trade_execution(ticker_price: float, event_time: int | None) 
                 execution_price,
                 event_time,
                 trade_levels["current_open_time"],
+                placement_ticker=price,
             )
             if row is None:
                 execution_state["tradePlacedInCurrentCandle"] = True
@@ -601,6 +654,7 @@ async def evaluate_trade_execution(ticker_price: float, event_time: int | None) 
                 "type": next_position_type,
                 "entryPrice": float(execution_price),
                 "size": row["size"],
+                "tradeId": row["id"],
             }
             execution_state["tradePlacedInCurrentCandle"] = True
             execution_state["executedTradeTime"] = row["dateTime"]
@@ -837,6 +891,45 @@ async def get_trades(interval: str) -> dict[str, Any]:
         rows = get_trade_history(interval)
 
     return {"interval": interval, "trade_history": rows}
+
+
+@app.get("/api/trades/{interval}/download")
+async def download_trades(interval: str):
+    if interval not in INTERVALS:
+        raise HTTPException(status_code=404, detail="Unsupported interval")
+
+    async with trade_history_lock:
+        rows = get_trade_history(interval)
+
+    headers = [
+        'tradeNumber','type','dateTime','signal','price','size','fill_status','fill_time','netPnl','favorableExcursion','adverseExcursion','cumulativePnl'
+    ]
+
+    def iter_csv():
+        yield ','.join(headers) + '\n'
+        for r in rows:
+            values = []
+            for h in headers:
+                v = r.get(h, '')
+                if v is None:
+                    values.append('')
+                    continue
+                if h in ('dateTime', 'fill_time'):
+                    try:
+                        values.append(f'"{datetime.fromisoformat(str(v)).isoformat()}"')
+                    except Exception:
+                        values.append(f'"{str(v)}"')
+                    continue
+                if isinstance(v, str):
+                    values.append('"' + v.replace('"', '""') + '"')
+                else:
+                    values.append(str(v))
+            yield ','.join(values) + '\n'
+
+    filename = f"trades-{interval}-{datetime.utcnow().isoformat().replace(':','-')}.csv"
+    return StreamingResponse(iter_csv(), media_type='text/csv', headers={
+        'Content-Disposition': f'attachment; filename="{filename}"'
+    })
 
 
 @app.post("/api/trades/{interval}")

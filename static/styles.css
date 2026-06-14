@@ -396,6 +396,22 @@ h1 {
   font-weight: 700;
 }
 
+.download-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--terminal-text);
+  font-size: 16px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+.download-btn:hover {
+  background: rgba(255,255,255,0.03);
+}
+
 .trade-table-wrap {
   position: relative;
   flex: 1;

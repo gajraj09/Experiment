@@ -68,7 +68,10 @@
 
         <section class="panel trade-history-panel">
           <div class="trade-history-header">
-            <div class="panel-title">Trade History</div>
+            <div style="display:flex; align-items:center; gap:12px;">
+              <div class="panel-title">Trade History</div>
+              <a id="download-trades" class="download-btn" title="Download trade list as Excel" href="/api/trades/5m/download">⬇️</a>
+            </div>
             <span class="trade-count" id="trade-count">0 trades</span>
           </div>
           <div class="trade-table-wrap">
@@ -82,6 +85,7 @@
                   <th>Entry Price</th>
                   <th>Quantity</th>
                   <th>Fill</th>
+                  <th>Fill Time</th>
                   <th>Net P&amp;L</th>
                   <th>Favorable Excursion</th>
                   <th>Adverse Excursion</th>
