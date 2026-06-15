@@ -28,3 +28,4 @@ P&L Calc: interval=5m, tradeNum=3, prev_price=1.1827, new_price=1.1831, size=1.0
 P&L Calc: interval=15m, tradeNum=2, prev_price=1.1815, new_price=1.1827, size=1.0, pnl=-0.0012
 P&L Calc: interval=5m, tradeNum=4, prev_price=1.1831, new_price=1.1836, size=1.0, pnl=-0.0005
 P&L Calc: interval=5m, tradeNum=5, prev_price=1.1836, new_price=1.1829, size=1.0, pnl=0.0007
+P&L Calc: interval=5m, tradeNum=2, prev_price=1.2781, new_price=1.2757, size=1.0, pnl=0.0024

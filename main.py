@@ -698,18 +698,28 @@ async def evaluate_trade_execution(ticker_price: float, event_time: int | None) 
             if not current_position:
                 continue
 
+            current_candle = candles[-1]
+            current_low = Decimal(current_candle["low"]).quantize(price_tick_size)
+            current_high = Decimal(current_candle["high"]).quantize(price_tick_size)
+
             position_type = current_position.get("type")
             buy_trigger_price = Decimal(trade_levels["buy_trigger_price"]).quantize(price_tick_size)
             sell_trigger_price = Decimal(trade_levels["sell_trigger_price"]).quantize(price_tick_size)
             next_position_type = None
             execution_price = price
 
-            if position_type == "long" and price <= sell_trigger_price:
+            if (
+                position_type == "long"
+                and price <= sell_trigger_price
+                and current_low <= price <= current_high
+            ):
                 next_position_type = "short"
-                execution_price = sell_trigger_price
-            elif position_type == "short" and price >= buy_trigger_price:
+            elif (
+                position_type == "short"
+                and price >= buy_trigger_price
+                and current_low <= price <= current_high
+            ):
                 next_position_type = "long"
-                execution_price = buy_trigger_price
 
             if next_position_type is None:
                 continue
