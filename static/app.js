@@ -398,5 +398,5 @@ tabs.forEach((tab) => {
 
 
 refreshAllMarkets();
-refreshTimer = window.setInterval(refreshAllMarkets, 1500);
+refreshTimer = window.setInterval(refreshAllMarkets, 250);
 setIntervalTab(activeInterval);

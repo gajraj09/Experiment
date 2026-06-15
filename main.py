@@ -26,10 +26,7 @@ DEFAULT_PRICE_TICK_SIZE = Decimal("0.0001")
 INTERVALS = {"5m", "15m"}
 BINANCE_FAPI = "https://fapi.binance.com"
 STREAM_SYMBOL = SYMBOL.lower()
-WS_URL = (
-    "wss://fstream.binance.com/stream"
-    f"?streams={STREAM_SYMBOL}@bookTicker/{STREAM_SYMBOL}@aggTrade"
-)
+WS_URL = f"wss://fstream.binance.com/ws/{STREAM_SYMBOL}@trade"
 RECONNECT_DELAY = 1
 DATA_DIR = Path("data")
 DATABASE_FILE = DATA_DIR / "tradingbot.db"
@@ -347,7 +344,7 @@ def check_and_update_last_unfilled_trade(interval: str, ticker_price: Decimal, e
                 ("Filled", fill_time_iso, int(row["id"])),
             )
             connection.commit()
-            logger.info("Marked trade id=%s interval=%s as Filled at %s", row["id"], interval, fill_time_iso)
+            # logger.info("Marked trade id=%s interval=%s as Filled at %s", row["id"], interval, fill_time_iso)
             return True
     except Exception:
         logger.exception("Error updating last unfilled trade for %s", interval)
@@ -416,6 +413,61 @@ def insert_manual_trade_row(interval: str, row: dict[str, Any]) -> None:
         row.get("signal"),
         row.get("price"),
     )
+
+
+def calculate_and_update_previous_trade_pnl(
+    interval: str,
+    new_entry_price: Decimal,
+    new_trade_size: float,
+    new_trade_number: int,
+) -> None:
+    """Calculate P&L for the previous trade when a new trade is executed.
+    P&L = (previous_entry_price - new_entry_price) * quantity
+    Only updates closed (previous) trades, not the current open trade."""
+    try:
+        with database_connection() as connection:
+            # Get the previous trade (one with tradeNumber = new_trade_number - 1)
+            row = connection.execute(
+                """
+                SELECT id, price, size, netPnl FROM trade_history
+                WHERE interval = ? AND tradeNumber = ?
+                """,
+                (interval, new_trade_number - 1),
+            ).fetchone()
+            
+            if not row:
+                logger.info("No previous trade found for tradeNumber=%s", new_trade_number - 1)
+                return
+            
+            if row["netPnl"] is not None:
+                logger.info("P&L already calculated for trade id=%s, netPnl=%s", row["id"], row["netPnl"])
+                return
+            
+            previous_entry_price = Decimal(str(row["price"])).quantize(price_tick_size)
+            previous_size = row["size"]
+            
+            # Calculate P&L: (previous_entry_price - new_entry_price) * quantity
+            pnl = float((previous_entry_price - new_entry_price) * Decimal(str(previous_size)))
+            
+            # Log to file for debugging
+            with open("data/pnl_debug.log", "a") as f:
+                f.write(f"P&L Calc: interval={interval}, tradeNum={new_trade_number}, prev_price={previous_entry_price}, new_price={new_entry_price}, size={previous_size}, pnl={pnl}\n")
+            
+            # Update the previous trade with P&L
+            connection.execute(
+                "UPDATE trade_history SET netPnl = ? WHERE id = ?",
+                (pnl, int(row["id"])),
+            )
+            connection.commit()
+            # logger.info(
+            #     "Updated trade id=%s with P&L: %.6f",
+            #     row["id"],
+            #     pnl,
+            # )
+    except Exception as e:
+        logger.exception("Error calculating P&L for previous trade in %s: %s", interval, str(e))
+        with open("data/pnl_debug.log", "a") as f:
+            f.write(f"Error: {str(e)}\n")
 
 
 def create_execution_trade_row(
@@ -496,14 +548,38 @@ def insert_execution_trade(
                 row["tradeNumber"],
             )
             return get_execution_trade_by_candle(interval, executed_candle_open_time)
-        logger.info(
-            "Execution trade placed successfully for interval %s tradeNumber=%s type=%s price=%s candle=%s",
-            interval,
-            row["tradeNumber"],
-            row["type"],
-            row["price"],
-            executed_candle_open_time,
-        )
+        # logger.info(
+        #     "Execution trade placed successfully for interval %s tradeNumber=%s type=%s price=%s candle=%s",
+        #     interval,
+        #     row["tradeNumber"],
+        #     row["type"],
+        #     row["price"],
+        #     executed_candle_open_time,
+        # )
+        print("Trade Executed")
+        payload = {
+            "symbol": SYMBOL,
+            "side": "BUY" if trade_type == "long" else "SELL",
+            "quantity": row["size"],
+            "price": row["price"],
+            "tradeNumber": row["tradeNumber"],
+            "interval": interval,
+            "secret": "my_secret_key",
+        }
+        try:
+            response = httpx.post("http://127.0.0.1:5000/webhook", json=payload, timeout=5.0)
+            response.raise_for_status()
+            print("Sent payload:", payload)
+        except httpx.RequestError as exc:
+            logger.exception("Webhook request error sending execution trade: %s", exc)
+            print("Webhook error:", exc)
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "Webhook response error for execution trade: status=%s body=%s",
+                exc.response.status_code,
+                exc.response.text,
+            )
+            print("Webhook error:", exc)
         return get_execution_trade_by_candle(interval, executed_candle_open_time)
 
 
@@ -650,6 +726,14 @@ async def evaluate_trade_execution(ticker_price: float, event_time: int | None) 
                 execution_state["tradePlacedInCurrentCandle"] = True
                 continue
 
+            # Calculate P&L for the previous trade using the new trade's entry price
+            calculate_and_update_previous_trade_pnl(
+                interval,
+                execution_price,
+                row["size"],
+                row["tradeNumber"],
+            )
+
             current_position_by_interval[interval] = {
                 "type": next_position_type,
                 "entryPrice": float(execution_price),
@@ -665,8 +749,6 @@ async def evaluate_trade_execution(ticker_price: float, event_time: int | None) 
 async def ticker_stream() -> None:
     json_loads = orjson.loads
     state_ref = state
-    book_stream = f"{STREAM_SYMBOL}@bookTicker"
-    trade_stream = f"{STREAM_SYMBOL}@aggTrade"
 
     while True:
         try:
@@ -678,27 +760,13 @@ async def ticker_stream() -> None:
                 max_queue=16,
                 compression=None,
             ) as ws:
-                logger.info("Connected to Binance Futures combined stream: %s", WS_URL)
+                logger.info("Connected to Binance Futures trade stream: %s", WS_URL)
                 async for message in ws:
-                    event = json_loads(message)
-                    stream = event.get("stream")
-                    data = event.get("data")
-
-                    if stream == book_stream:
-                        bid = float(data["b"])
-                        ask = float(data["a"])
-                        spread = ask - bid
-                        state_ref["best_bid"] = bid
-                        state_ref["best_ask"] = ask
-                        state_ref["mid_price"] = bid + (spread / 2)
-                        state_ref["spread"] = spread
-                        state_ref["updated_at"] = data.get("E") or data.get("T")
-                        await evaluate_trade_execution(state_ref["mid_price"], state_ref["updated_at"])
-                    elif stream == trade_stream:
-                        ticker_price = float(data["p"])
-                        state_ref["last_trade_price"] = ticker_price
-                        state_ref["updated_at"] = data.get("E") or data.get("T")
-                        await evaluate_trade_execution(ticker_price, state_ref["updated_at"])
+                    data = json_loads(message)
+                    ticker_price = float(data["p"])
+                    state_ref["last_trade_price"] = ticker_price
+                    state_ref["updated_at"] = data.get("E") or data.get("T")
+                    await evaluate_trade_execution(ticker_price, state_ref["updated_at"])
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -862,9 +930,7 @@ async def market_snapshot(interval: str) -> dict[str, Any]:
         "last_trade_number": last_trade_number,
         "symbol": SYMBOL,
         "interval": interval,
-        "ticker_price": format_price(
-            state["last_trade_price"] or state["mid_price"] or candles[-1]["close"]
-        ),
+        "ticker_price": format_price(state["last_trade_price"] or candles[-1]["close"]),
         "last_trade_price": format_price(state["last_trade_price"])
         if state["last_trade_price"] is not None
         else None,
