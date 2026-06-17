@@ -17,9 +17,13 @@ const fillStatusLabel = document.querySelector("#fill-status");
 const fillStatusCard = document.querySelector("#position-card1");
 const liveStatusDot = document.querySelector("#live-status");
 const liveStatusText = document.querySelector("#live-status-text");
+const verifyTradeEl = document.querySelector("#verify-trade");
+const verify5mEl = document.querySelector("#verify-5m");
+const verify15mEl = document.querySelector("#verify-15m");
 
 let activeInterval = "5m";
 let refreshTimer;
+let lastVerifyOpenTime = null;
  
 const marketCache = new Map();
 const intervals = ["5m", "15m"];
@@ -192,6 +196,7 @@ function renderTradeHistory(rows) {
           <td><span class="signal ${row.signal.toLowerCase()}">${row.signal}</span></td>
           <td>${formatNumber(row.price)}</td>
           <td>${formatNumber(row.size, 2)}</td>
+          <td>${row.openCandleTime || '<span class="neutral">--</span>'}</td>
           <td>
             ${row.fill_status ? `<span class="fill-badge ${row.fill_status.toLowerCase()}">${row.fill_status}</span>` : '<span class="neutral">--</span>'}
           </td>
@@ -208,10 +213,201 @@ function renderTradeHistory(rows) {
   renderTradeSummary(rows);
 }
 
+function normalizeVerifyPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const tradeNumber = payload["trade#"] ?? payload.tradeNumber ?? payload.trade_num ?? payload.trade_number ?? payload.tradeNumberStr;
+  const interval = payload.interval ?? payload.Interval ?? payload.interval_name;
+  const openCandleTime =
+    payload["open candle time"] ??
+    payload.openCandleTime ??
+    payload.open_candle_time ??
+    payload["openCandleTime"] ??
+    payload.candle_open_time ??
+    payload.candleOpenTime;
+  const type = payload.type ?? payload.tradeType ?? payload.trade_type ?? payload.side;
+  const entryPrice = payload["entry price"] ?? payload.entryPrice ?? payload.entry_price ?? payload.price ?? payload.entry;
+
+  if (tradeNumber == null && interval == null && openCandleTime == null && type == null && entryPrice == null) {
+    return null;
+  }
+
+  return {
+    tradeNumber,
+    interval,
+    openCandleTime,
+    type,
+    entryPrice,
+  };
+}
+
+// Pretty-print fallback for unknown payloads
+function renderRawPayload(el, payload) {
+  if (!el) return;
+  try {
+    el.classList.remove("verify-empty");
+    let toDisplay = payload;
+    if (typeof payload === 'string' && payload.trim().startsWith('@{') && payload.trim().endsWith('}')) {
+      // parse PowerShell-style @{k=v; a=b}
+      const inner = payload.trim().slice(2, -1);
+      const parsed = {};
+      inner.split(';').forEach((part) => {
+        const p = part.trim();
+        if (!p) return;
+        const eq = p.indexOf('=');
+        if (eq === -1) return;
+        const k = p.slice(0, eq).trim();
+        let v = p.slice(eq + 1).trim();
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+        const n = Number(v);
+        parsed[k] = Number.isNaN(n) ? v : n;
+      });
+      toDisplay = parsed;
+    }
+
+    el.innerHTML = `<pre class="verify-raw">${JSON.stringify(toDisplay, null, 2)}</pre>`;
+  } catch (e) {
+    el.textContent = String(payload);
+  }
+}
+
+function renderVerifyTradeForElement(el, payload) {
+  if (!el) return;
+
+  if (!payload) {
+    el.innerHTML = `<div class="verify-cell verify-empty">No verify trade data available</div>`;
+    return;
+  }
+
+  const entryPriceValue = payload.entryPrice != null ? Number(payload.entryPrice) : null;
+  const entryPriceLabel = entryPriceValue != null && !Number.isNaN(entryPriceValue)
+    ? formatNumber(entryPriceValue)
+    : payload.entryPrice ?? "--";
+
+  el.classList.remove("verify-empty");
+  el.innerHTML = `
+    <div class="verify-cell">
+      <span>Trade #</span>
+      <strong>${payload.tradeNumber ?? "--"}</strong>
+    </div>
+    <div class="verify-cell">
+      <span>Interval</span>
+      <strong>${payload.interval ?? "--"}</strong>
+    </div>
+    <div class="verify-cell">
+      <span>Open Candle Time</span>
+      <strong>${payload.openCandleTime ?? "--"}</strong>
+    </div>
+    <div class="verify-cell">
+      <span>Type</span>
+      <strong>${payload.type ?? "--"}</strong>
+    </div>
+    <div class="verify-cell">
+      <span>Entry Price</span>
+      <strong>${entryPriceLabel}</strong>
+    </div>
+  `;
+}
+
+function getFirst(obj, keys) {
+  for (const k of keys) {
+    if (obj == null) return null;
+    if (Object.prototype.hasOwnProperty.call(obj, k)) return obj[k];
+    // also check camelCase
+    const camel = k.replace(/_([a-z])/g, (m, c) => c.toUpperCase());
+    if (Object.prototype.hasOwnProperty.call(obj, camel)) return obj[camel];
+  }
+  return null;
+}
+
+function renderVerifyFields(el, obj) {
+  if (!el) return;
+  if (!obj || typeof obj !== 'object') {
+    el.innerHTML = `<div class="verify-cell verify-empty">No verify trade data available</div>`;
+    return;
+  }
+
+  // Ensure we have the innermost payload if nested
+  function deepUnwrap(o) {
+    if (!o || typeof o !== 'object') return o;
+    if (o.payload !== undefined) return deepUnwrap(o.payload);
+    return o;
+  }
+
+  const payload = deepUnwrap(obj);
+
+  const order = [
+    { key: 'trade_number', label: 'trade_number' },
+    { key: 'candle_open_time', label: 'candle_open_time' },
+    { key: 'type', label: 'type' },
+    { key: 'entry_price', label: 'entry_price' },
+    { key: 'interval', label: 'interval' },
+  ];
+
+  const rows = order.map((item) => {
+    const val = getFirst(payload, [item.key, item.key.replace(/_/g, ''), item.key.replace(/_/g, '\\'), item.key.replace(/_/g, '').toLowerCase(), item.key.replace(/_/g, '').toUpperCase(), item.key.replace(/_/g, '').charAt(0)]);
+    const display = val == null ? '--' : val;
+    return `
+      <div class="verify-cell">
+        <span>${item.label}</span>
+        <strong>${display}</strong>
+      </div>
+    `;
+  }).join('');
+
+  el.classList.remove('verify-empty');
+  el.innerHTML = rows;
+}
+
+async function loadVerifyTrade() {
+  try {
+    const response = await fetch("/api/verify", { cache: "no-store" });
+    if (!response.ok) throw new Error(`Verify fetch failed ${response.status}`);
+    const json = await response.json();
+    console.debug("/api/verify response:", json);
+
+    // json is expected to be { "5m": { status..., payload: ... }, "15m": { ... } }
+    // unwrap proxy envelope: responses may be { status, status_code, payload: { ... } }
+    const unwrap = (obj) => {
+      if (!obj) return null;
+      if (typeof obj === 'object' && obj.payload !== undefined) return obj.payload;
+      return obj;
+    };
+
+    let data5 = unwrap(json["5m"] ?? null);
+    let data15 = unwrap(json["15m"] ?? null);
+
+    // some proxies return another nested envelope { payload: "@{...}" }
+    if (data5 && typeof data5 === 'object' && data5.payload !== undefined) data5 = data5.payload;
+    if (data15 && typeof data15 === 'object' && data15.payload !== undefined) data15 = data15.payload;
+
+    console.debug("verify payloads", { data5, data15 });
+
+    const p5 = normalizeVerifyPayload(data5);
+    const p15 = normalizeVerifyPayload(data15);
+
+    if (p5) {
+      // render the ordered fields for 5m
+      renderVerifyFields(verify5mEl, data5 ?? p5);
+    } else {
+      renderVerifyFields(verify5mEl, data5 ?? p5);
+    }
+
+    // render the ordered fields for 15m
+    renderVerifyFields(verify15mEl, data15 ?? p15);
+  } catch (error) {
+    console.warn("Unable to load verify trade data", error);
+    renderVerifyTradeForElement(verify5mEl, null);
+    renderVerifyTradeForElement(verify15mEl, null);
+  }
+}
+
 function exportRowsToCSV(rows) {
   if (!rows || !rows.length) return null;
   const headers = [
-    'tradeNumber','type','dateTime','signal','price','size','fill_status','fill_time','netPnl','favorableExcursion','adverseExcursion','cumulativePnl'
+    'tradeNumber','type','dateTime','signal','price','size','openCandleTime','fill_status','fill_time','netPnl','favorableExcursion','adverseExcursion','cumulativePnl'
   ];
 
   const csv = [headers.join(',')];
@@ -370,6 +566,7 @@ function refreshAllMarkets() {
   intervals.forEach((interval) => {
     loadMarket(interval, interval === activeInterval);
   });
+  loadVerifyTrade();
 }
 
 function setIntervalTab(interval) {
@@ -389,6 +586,15 @@ function setIntervalTab(interval) {
   } else {
     statusLine.textContent = "Loading market data...";
     loadMarket(interval, true);
+  }
+  // show only the verify column for the active interval
+  try {
+    const v5col = verify5mEl ? verify5mEl.closest('.verify-column') : null;
+    const v15col = verify15mEl ? verify15mEl.closest('.verify-column') : null;
+    if (v5col) v5col.style.display = interval === '5m' ? '' : 'none';
+    if (v15col) v15col.style.display = interval === '15m' ? '' : 'none';
+  } catch (e) {
+    // ignore
   }
 }
 

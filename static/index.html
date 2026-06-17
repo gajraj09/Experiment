@@ -57,6 +57,20 @@
         </section>
 
         <section class="panel">
+          <div class="panel-title">Verify Trade</div>
+          <div class="verify-trade-grid" id="verify-trade">
+            <div class="verify-column">
+              <div class="verify-subtitle">5m</div>
+              <div id="verify-5m" class="verify-row">Waiting for verify payload…</div>
+            </div>
+            <div class="verify-column">
+              <div class="verify-subtitle">15m</div>
+              <div id="verify-15m" class="verify-row">Waiting for verify payload…</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
           <div class="panel-title">Trade Execution Status</div>
           <div class="levels-grid" id="trade-execution-status"></div>
         </section>
@@ -84,6 +98,7 @@
                   <th>Signal</th>
                   <th>Entry Price</th>
                   <th>Quantity</th>
+                  <th>Open Candle Time</th>
                   <th>Fill</th>
                   <th>Fill Time</th>
                   <th>Net P&amp;L</th>

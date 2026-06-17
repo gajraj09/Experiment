@@ -297,6 +297,55 @@ h1 {
   gap: 12px;
 }
 
+.verify-trade-grid {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+}
+.verify-column {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* container that holds the five field cards */
+.verify-row {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  align-items: stretch;
+}
+.verify-subtitle {
+  display: none; /* hide the small 5m/15m tag above the boxes */
+}
+.verify-cell {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  background: #fbfcfe;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 88px;
+}
+.verify-cell span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.verify-cell strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 18px;
+}
+.verify-raw {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink);
+}
+
 .ohlc-grid,
 .levels-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
