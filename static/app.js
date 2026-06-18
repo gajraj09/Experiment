@@ -25,7 +25,14 @@ const marketCache = new Map();
 const intervals = ["5m", "15m"];
 
 function formatTime(value) {
-  return new Date(value).toLocaleString();
+  if (value === null || value === undefined || value === '') return '--';
+  // numeric timestamps (ms)
+  if (typeof value === 'number') return new Date(value).toLocaleString();
+  // try parsing ISO or other Date-parsable strings
+  const d = new Date(value);
+  if (!isNaN(d.getTime())) return d.toLocaleString();
+  // fallback: value is already a formatted display string (e.g. "17-06-2026 23:15:00 IST")
+  return String(value);
 }
 
 function formatTimeOnly(value) {
@@ -196,10 +203,8 @@ function renderTradeHistory(rows) {
             ${row.fill_status ? `<span class="fill-badge ${row.fill_status.toLowerCase()}">${row.fill_status}</span>` : '<span class="neutral">--</span>'}
           </td>
           <td>${row.fill_time ? formatTime(row.fill_time) : '<span class="neutral">--</span>'}</td>
+          <td>${row.openCandleTime ? formatTime(row.openCandleTime) : '<span class="neutral">--</span>'}</td>
           <td>${formatPnl(row.netPnl)}</td>
-          <td>${formatExcursion(row.favorableExcursion, true)}</td>
-          <td>${formatExcursion(row.adverseExcursion, false)}</td>
-          <td>${formatPnl(row.cumulativePnl)}</td>
         </tr>
       `
     )
@@ -211,7 +216,7 @@ function renderTradeHistory(rows) {
 function exportRowsToCSV(rows) {
   if (!rows || !rows.length) return null;
   const headers = [
-    'tradeNumber','type','dateTime','signal','price','size','fill_status','fill_time','netPnl','favorableExcursion','adverseExcursion','cumulativePnl'
+    'tradeNumber','type','dateTime','signal','price','size','fill_status','fill_time','openCandleTime','netPnl','favorableExcursion','adverseExcursion','cumulativePnl'
   ];
 
   const csv = [headers.join(',')];
@@ -220,7 +225,7 @@ function exportRowsToCSV(rows) {
       let v = r[h];
       if (v === null || v === undefined) return '';
       // if date, format as ISO
-      if (h === 'dateTime' || h === 'fill_time') {
+      if (h === 'dateTime' || h === 'fill_time' || h === 'openCandleTime') {
         try { return `"${new Date(v).toISOString()}"`; } catch(e) { return `"${v}"`; }
       }
       // escape quotes and commas

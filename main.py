@@ -2,7 +2,7 @@ import asyncio
 import logging
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
@@ -85,6 +85,7 @@ class TradeRow(BaseModel):
     favorableExcursion: float | None = None
     adverseExcursion: float | None = None
     cumulativePnl: float | None = None
+    openCandleTime: str | None = None
 
 
 def empty_trade_history() -> dict[str, list[dict[str, Any]]]:
@@ -115,7 +116,8 @@ def init_database() -> None:
                 favorableExcursion REAL,
                 adverseExcursion REAL,
                 cumulativePnl REAL,
-                executedCandleOpenTime INTEGER
+                executedCandleOpenTime INTEGER,
+                openCandleTime TEXT
             )
             """
         )
@@ -143,6 +145,8 @@ def init_database() -> None:
             connection.execute("ALTER TABLE trade_history ADD COLUMN placed_ticker REAL")
         if "moved_since_placement" not in cols:
             connection.execute("ALTER TABLE trade_history ADD COLUMN moved_since_placement INTEGER DEFAULT 0")
+        if "openCandleTime" not in cols:
+            connection.execute("ALTER TABLE trade_history ADD COLUMN openCandleTime TEXT")
 
 
 def trade_row_from_db(row: sqlite3.Row) -> dict[str, Any]:
@@ -162,8 +166,15 @@ def trade_row_from_db(row: sqlite3.Row) -> dict[str, Any]:
         "fill_time": row["fill_time"] if "fill_time" in row.keys() else None,
         "placed_ticker": row["placed_ticker"] if "placed_ticker" in row.keys() else None,
         "moved_since_placement": bool(row["moved_since_placement"]) if "moved_since_placement" in row.keys() else False,
+        "openCandleTime": row["openCandleTime"] if "openCandleTime" in row.keys() else None,
     }
 
+def format_timestamp_ist(timestamp_ms: int | None) -> str | None:
+    if timestamp_ms is None:
+        return None
+    ist = timezone(timedelta(hours=5, minutes=30))
+    dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).astimezone(ist)
+    return dt.strftime("%d-%m-%Y %H:%M:%S IST")
 
 def get_trade_history(interval: str) -> list[dict[str, Any]]:
     with database_connection() as connection:
@@ -171,14 +182,23 @@ def get_trade_history(interval: str) -> list[dict[str, Any]]:
             """
             SELECT id, tradeNumber, type, dateTime, signal, price, size, netPnl,
                    favorableExcursion, adverseExcursion, cumulativePnl,
-                   fill_status, fill_time, placed_ticker, moved_since_placement
+                   fill_status, fill_time, placed_ticker, moved_since_placement, openCandleTime,
+                   executedCandleOpenTime
             FROM trade_history
             WHERE interval = ?
             ORDER BY id ASC
             """,
             (interval,),
         ).fetchall()
-    return [trade_row_from_db(row) for row in rows]
+
+    def sort_key(row: sqlite3.Row) -> tuple[int, int, int]:
+        open_time = row["openCandleTime"] if "openCandleTime" in row.keys() else None
+        open_epoch = parse_open_candle_time_to_epoch(open_time) or 0
+        executed_epoch = int(row["executedCandleOpenTime"] or 0)
+        return (executed_epoch or open_epoch, open_epoch, int(row["id"]))
+
+    sorted_rows = sorted(rows, key=sort_key)
+    return [trade_row_from_db(row) for row in sorted_rows]
 
 
 def get_last_trade_number(interval: str) -> int | None:
@@ -255,6 +275,102 @@ def next_trade_number(interval: str, connection: sqlite3.Connection | None = Non
     finally:
         if owns_connection:
             connection.close()
+
+
+def get_trade_by_open_candle_time(interval: str, open_candle_time: str) -> sqlite3.Row | None:
+    """Get a trade from history by interval and openCandleTime"""
+    with database_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM trade_history
+            WHERE interval = ? AND openCandleTime = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (interval, open_candle_time),
+        ).fetchone()
+    return row
+
+def get_last_trade_by_interval(interval: str) -> sqlite3.Row | None:
+    """Get the very last trade for an interval"""
+    with database_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM trade_history
+            WHERE interval = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (interval,),
+        ).fetchone()
+    return row
+
+
+def sync_current_position_from_last_trade(interval: str) -> None:
+    """Sync current_position_by_interval with the actual last trade's type in the database"""
+    last_trade = get_last_trade_by_interval(interval)
+    if last_trade:
+        current_position_by_interval[interval] = {
+            "type": last_trade["type"],
+            "entryPrice": float(Decimal(str(last_trade["price"])).quantize(price_tick_size)),
+            "size": last_trade["size"],
+            "tradeId": last_trade["id"],
+        }
+
+
+def parse_open_candle_time_to_epoch(open_candle_time: str) -> int | None:
+    try:
+        text = open_candle_time.strip()
+        if text.endswith(" IST"):
+            text = text[:-4].strip()
+        dt = datetime.strptime(text, "%d-%m-%Y %H:%M:%S")
+        ist = timezone(timedelta(hours=5, minutes=30))
+        dt = dt.replace(tzinfo=ist)
+        return int(dt.astimezone(timezone.utc).timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def get_trade_rows_by_open_candle_time(interval: str) -> list[sqlite3.Row]:
+    with database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM trade_history
+            WHERE interval = ? AND openCandleTime IS NOT NULL
+            """,
+            (interval,),
+        ).fetchall()
+    return list(rows)
+
+
+def find_trade_neighbors_by_open_candle_time(
+    interval: str, target_open_candle_time: str
+) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+    target_epoch = parse_open_candle_time_to_epoch(target_open_candle_time)
+    if target_epoch is None:
+        return None, None
+
+    candidates: list[tuple[int, sqlite3.Row]] = []
+    for row in get_trade_rows_by_open_candle_time(interval):
+        row_open_time = row["openCandleTime"]
+        if not row_open_time:
+            continue
+        row_epoch = parse_open_candle_time_to_epoch(row_open_time)
+        if row_epoch is None:
+            continue
+        if row_epoch == target_epoch:
+            continue
+        candidates.append((row_epoch, row))
+
+    candidates.sort(key=lambda item: item[0])
+    previous_row = None
+    next_row = None
+    for epoch, row in candidates:
+        if epoch < target_epoch:
+            previous_row = row
+        elif epoch > target_epoch and next_row is None:
+            next_row = row
+            break
+
+    return previous_row, next_row
 
 
 def check_and_update_last_unfilled_trade(interval: str, ticker_price: Decimal, event_time: int | None) -> bool:
@@ -363,9 +479,9 @@ def insert_trade_history_row(
             INSERT OR IGNORE INTO trade_history (
                 interval, tradeNumber, type, dateTime, signal, price, size,
                 netPnl, favorableExcursion, adverseExcursion, cumulativePnl,
-                executedCandleOpenTime, fill_status, fill_time
+                executedCandleOpenTime, fill_status, fill_time, openCandleTime
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 interval,
@@ -382,6 +498,7 @@ def insert_trade_history_row(
                 executed_candle_open_time,
                 row.get("fill_status"),
                 row.get("fill_time"),
+                row.get("openCandleTime"),
             ),
         )
         connection.commit()
@@ -496,6 +613,223 @@ def create_execution_trade_row(
         "moved_since_placement": False,
     }
 
+def verify_active_trade(interval: str, verify_trade_data: dict[str, Any]) -> bool:
+    """
+    Verification logic:
+
+    1. Find trade by openCandleTime.
+    2. If found and type matches -> do nothing.
+    3. If found and type differs -> update the matched row to MISSED and
+       also update the next row when one exists.
+    4. If no matching candle found -> insert a MISSED row and update the
+       next row when one exists.
+    5. Prevent duplicate MISSED inserts for the same candle.
+    """
+
+    logger.debug(f"[VERIFY] Starting verification for interval={interval}")
+
+    open_candle_time = verify_trade_data.get("candle_open_time")
+    payload_type = str(verify_trade_data.get("type", "")).lower()
+    if not open_candle_time or not payload_type:
+        logger.warning(
+            f"[VERIFY] Invalid verify_trade_data for {interval}: "
+            f"missing candle_open_time or type"
+        )
+        return False
+
+    trade_history = get_trade_history(interval)
+    if len(trade_history) <= 1:
+        logger.info(
+            f"[VERIFY] Skipping verification for {interval}: "
+            f"trade history too small ({len(trade_history)} entries)"
+        )
+        return False
+
+    history_row = get_trade_by_open_candle_time(interval, open_candle_time)
+    previous_row, next_row = find_trade_neighbors_by_open_candle_time(interval, open_candle_time)
+
+    if history_row:
+        history_type = str(history_row["type"]).lower()
+
+        if history_type == payload_type:
+            return False
+
+        logger.info(
+            f"[VERIFY] Matching candle found "
+            f"interval={interval}, "
+            f"candle={open_candle_time}, "
+            f"history_type={history_type}, "
+            f"payload_type={payload_type}"
+        )
+
+        template_row = history_row
+        correction_type = payload_type
+        correction_price = Decimal(str(template_row["price"]))
+        # When type mismatch on existing row, next row swaps to opposite of payload type
+        next_type = "short" if payload_type == "long" else "long"
+        next_id = int(next_row["id"]) if next_row is not None else None
+    else:
+        logger.warning(
+            f"[VERIFY] No matching candle found "
+            f"for interval={interval}, "
+            f"candle={open_candle_time}. "
+            f"Treating as MISSED trade."
+        )
+
+        if previous_row is not None:
+            template_row = previous_row
+        else:
+            template_row = get_last_trade_by_interval(interval)
+
+        if not template_row:
+            logger.warning(
+                f"[VERIFY] Cannot insert MISSED trade. "
+                f"No existing trade history for interval={interval}"
+            )
+            return False
+
+        correction_type = payload_type
+        correction_price = Decimal(str(template_row["price"]))
+        # For missing candle insertion, next row swaps to opposite type
+        next_type = "short" if payload_type == "long" else "long"
+        next_id = int(next_row["id"]) if next_row is not None else None
+
+    try:
+        with database_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            existing = connection.execute(
+                """
+                SELECT id
+                FROM trade_history
+                WHERE interval = ?
+                  AND openCandleTime = ?
+                  AND signal = 'MISSED'
+                LIMIT 1
+                """,
+                (interval, open_candle_time),
+            ).fetchone()
+
+            if existing:
+                logger.info(
+                    f"[VERIFY] MISSED trade already exists "
+                    f"interval={interval}, "
+                    f"candle={open_candle_time}"
+                )
+                connection.rollback()
+                return False
+
+            if history_row:
+                connection.execute(
+                    "UPDATE trade_history SET type = ?, signal = ? WHERE id = ?",
+                    (correction_type, "MISSED", int(history_row["id"])),
+                )
+                if next_id is not None:
+                    connection.execute(
+                        "UPDATE trade_history SET type = ?, signal = ? WHERE id = ?",
+                        (next_type, "MISSED", next_id),
+                    )
+                trade_id = int(history_row["id"])
+                trade_number = int(history_row["tradeNumber"])
+            else:
+                trade_number = next_trade_number(interval, connection)
+                event_time = int(datetime.now(timezone.utc).timestamp() * 1000)
+                cursor = connection.execute(
+                    """
+                    INSERT INTO trade_history (
+                        interval,
+                        tradeNumber,
+                        type,
+                        dateTime,
+                        signal,
+                        price,
+                        size,
+                        netPnl,
+                        favorableExcursion,
+                        adverseExcursion,
+                        cumulativePnl,
+                        executedCandleOpenTime,
+                        openCandleTime,
+                        fill_status,
+                        fill_time,
+                        placed_ticker,
+                        moved_since_placement
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        interval,
+                        trade_number,
+                        correction_type,
+                        event_time_to_iso(event_time),
+                        "MISSED",
+                        float(correction_price),
+                        template_row["size"],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        open_candle_time,
+                        template_row["fill_status"]
+                        if "fill_status" in template_row.keys()
+                        else "Unfilled",
+                        template_row["fill_time"]
+                        if "fill_time" in template_row.keys()
+                        else None,
+                        float(correction_price),
+                        False,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    logger.error(
+                        f"[VERIFY] Failed to insert MISSED trade "
+                        f"for interval={interval}"
+                    )
+                    connection.rollback()
+                    return False
+
+                trade_id = int(cursor.lastrowid or 0)
+
+                if next_id is not None:
+                    connection.execute(
+                        "UPDATE trade_history SET type = ?, signal = ? WHERE id = ?",
+                        (next_type, "MISSED", next_id),
+                    )
+
+            connection.commit()
+
+            # Sync current position from actual last trade in database
+            sync_current_position_from_last_trade(interval)
+
+            execution_state = trade_execution_state_by_interval[interval]
+            execution_state["executedTradeNumber"] = trade_number
+            execution_state["executedTradeTime"] = event_time_to_iso(
+                int(datetime.now(timezone.utc).timestamp() * 1000)
+            )
+            execution_state["executedCandleOpenTime"] = open_candle_time
+            execution_state["tradePlacedInCurrentCandle"] = True
+
+            logger.info(
+                f"[VERIFY] MISSED TRADE CORRECTED | "
+                f"interval={interval} | "
+                f"tradeNumber={trade_number} | "
+                f"type={correction_type} | "
+                f"candle={open_candle_time} | "
+                f"tradeId={trade_id}"
+            )
+
+            return True
+
+    except Exception as e:
+        logger.exception(
+            f"[VERIFY] ERROR in verify_active_trade "
+            f"for interval={interval}: {e}"
+        )
+        return False
+
+
+
 
 def insert_execution_trade(
     interval: str,
@@ -511,14 +845,16 @@ def insert_execution_trade(
         # store the ticker observed at the time of placement so we can require price movement before fill
         row["placed_ticker"] = float(placement_ticker) if placement_ticker is not None else None
         row["moved_since_placement"] = False
+        # convert executed_candle_open_time to IST format for openCandleTime
+        row["openCandleTime"] = format_timestamp_ist(executed_candle_open_time)
         cursor = connection.execute(
             """
             INSERT OR IGNORE INTO trade_history (
                 interval, tradeNumber, type, dateTime, signal, price, size,
                 netPnl, favorableExcursion, adverseExcursion, cumulativePnl,
-                executedCandleOpenTime, fill_status, fill_time, placed_ticker, moved_since_placement
+                executedCandleOpenTime, fill_status, fill_time, placed_ticker, moved_since_placement, openCandleTime
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 interval,
@@ -537,6 +873,7 @@ def insert_execution_trade(
                 row.get("fill_time"),
                 row["placed_ticker"],
                 row["moved_since_placement"],
+                row.get("openCandleTime"),
             ),
         )
         connection.commit()
@@ -853,15 +1190,39 @@ async def refresh_candle_cache() -> None:
         await asyncio.sleep(1)
 
 
+def interval_to_milliseconds(interval: str) -> int:
+    if interval.endswith("m"):
+        return int(interval[:-1]) * 60 * 1000
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 60 * 60 * 1000
+    raise ValueError(f"Unsupported interval: {interval}")
+
+
+def current_candle_open_time(interval: str, now: datetime | None = None) -> int:
+    now = now or datetime.now(timezone.utc)
+    interval_ms = interval_to_milliseconds(interval)
+    return int(now.timestamp() * 1000) // interval_ms * interval_ms
+
+
+def is_stale_candle_cache(interval: str, candles: list[dict[str, Any]]) -> bool:
+    if not candles:
+        return True
+    latest_open_time = candles[-1].get("open_time")
+    if latest_open_time is None:
+        return True
+    expected_open_time = current_candle_open_time(interval)
+    return int(latest_open_time) != expected_open_time
+
+
 async def get_cached_klines(interval: str) -> list[dict[str, Any]]:
     async with candle_lock:
         candles = candle_cache.get(interval)
 
-    if candles:
+    if candles and not is_stale_candle_cache(interval, candles):
         return candles
 
     try:
-        candles = await fetch_klines(interval)
+        fresh_candles = await fetch_klines(interval)
     except HTTPException:
         # If we cannot fetch fresh candles, preserve existing cache if possible.
         if candles:
@@ -869,8 +1230,8 @@ async def get_cached_klines(interval: str) -> list[dict[str, Any]]:
         raise
 
     async with candle_lock:
-        candle_cache[interval] = candles
-    return candles
+        candle_cache[interval] = fresh_candles
+    return fresh_candles
 
 
 @asynccontextmanager
@@ -957,6 +1318,32 @@ async def market_snapshot(interval: str) -> dict[str, Any]:
         "trade_history": trade_history,
     }
 
+@app.get("/api/verify")
+async def proxy_verify() -> dict[str, Any]:
+    results: dict[str, Any] = {}
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        for interval in sorted(INTERVALS):
+            url = f"http://127.0.0.1:5000/verify/{interval}"
+
+            try:
+                resp = await client.get(url)
+
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    # print(f"Verification result for {interval}: {payload}")
+
+                    if isinstance(payload, dict):
+                        verify_active_trade(interval, payload)
+
+                    results[interval] = payload
+                else:
+                    results[interval] = None
+
+            except Exception:
+                results[interval] = None
+
+    return results
 
 @app.get("/api/trades/{interval}")
 async def get_trades(interval: str) -> dict[str, Any]:
